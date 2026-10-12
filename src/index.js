@@ -34,6 +34,25 @@ const REMOTE_ACTIONS = [
     confirm: 'Close DAT on this computer and show the Dat Desk dashboard?'
   },
   { type: 'hide-dat', label: 'Hide DAT', verb: 'hide the DAT window' },
+  { type: 'reload-dat', label: 'Reload DAT', verb: 'reload DAT' },
+  {
+    type: 'refresh-session',
+    label: 'Refresh session',
+    verb: 'refresh the DAT session',
+    confirm: 'Refresh the DAT session on this computer? DAT closes, its cache is wiped, and it reopens with a fresh session.'
+  },
+  {
+    type: 'sign-out',
+    label: 'Sign out',
+    verb: 'sign out of Dat Desk',
+    confirm: 'Sign this person out of Dat Desk? DAT closes and they must sign in again.'
+  },
+  {
+    type: 'restart-app',
+    label: 'Restart app',
+    verb: 'restart Dat Desk',
+    confirm: 'Restart Dat Desk on this computer? It closes and opens again on the dashboard.'
+  },
   {
     type: 'clear-cache',
     label: 'Clear cache',

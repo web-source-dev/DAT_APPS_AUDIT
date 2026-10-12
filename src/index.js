@@ -21,8 +21,34 @@ const MAX_SHOT_BYTES = 6 * 1024 * 1024;
 const COOKIE = 'te_admin';
 const ONLINE_MS = 20000;
 const REQUEST_MS = 90000;
+// Once the app has picked a remote action up, it gets this long to finish (Open DAT is slow).
+const COMMAND_RUN_MS = 3 * 60 * 1000;
 const PRESENCE_KEEP_MS = 10 * 60 * 1000;
 const LIVE_MAX_BYTES = 3 * 1024 * 1024;
+const REMOTE_ACTIONS = [
+  { type: 'open-dat', label: 'Open DAT', verb: 'open DAT' },
+  {
+    type: 'close-dat',
+    label: 'Close DAT',
+    verb: 'close DAT and open the dashboard',
+    confirm: 'Close DAT on this computer and show the Dat Desk dashboard?'
+  },
+  { type: 'hide-dat', label: 'Hide DAT', verb: 'hide the DAT window' },
+  {
+    type: 'clear-cache',
+    label: 'Clear cache',
+    verb: 'clear the DAT cache',
+    confirm: 'Clear the DAT cache on this computer? DAT will close, and the next open loads a fresh session.'
+  },
+  {
+    type: 'quit-app',
+    label: 'Quit app',
+    verb: 'quit Dat Desk',
+    danger: true,
+    confirm: 'Quit Dat Desk on this computer and remove it from the tray?'
+  }
+];
+const REMOTE_TYPES = new Set(REMOTE_ACTIONS.map((action) => action.type));
 const liveFrames = new Map();
 const liveWatchers = new Map();
 const liveSessions = new Map();
@@ -106,6 +132,15 @@ function loadPresence() {
       device.pending = null;
       dirty = true;
     }
+    if (device.command && !freshCommand(device)) {
+      device.commandResult = expiredCommandResult(device);
+      device.command = null;
+      dirty = true;
+    }
+    if (device.commandResult && !freshCommandResult(device)) {
+      device.commandResult = null;
+      dirty = true;
+    }
     fresh[key] = device;
   }
   if (dirty) savePresence(fresh);
@@ -155,19 +190,68 @@ function rememberAlert(report, body) {
   saveAlerts(list.slice(0, 200));
 }
 
+/** One row per computer (or email), newest alert first, so a noisy device does not flood the list. */
+function alertGroups(alerts) {
+  const groups = new Map();
+  for (const alert of alerts) {
+    const key = alert.deviceId || `email:${emailKey(alert.email)}`;
+    if (!groups.has(key)) {
+      groups.set(key, { key, deviceId: alert.deviceId || '', email: '', hostname: '', items: [] });
+    }
+    const group = groups.get(key);
+    if (!group.email && alert.email) group.email = alert.email;
+    if (!group.hostname && alert.hostname) group.hostname = alert.hostname;
+    group.items.push(alert);
+  }
+  return [...groups.values()];
+}
+
 function alertMarkup(alerts) {
-  if (!alerts.length) return '';
-  return `<div class="alert-stack">${alerts
-    .map((alert) => {
-      const who = alert.email || 'No email';
-      const where = alert.hostname ? ` on ${alert.hostname}` : '';
-      const href = alert.deviceId ? `/device/${encodeURIComponent(alert.deviceId)}` : '/';
-      return `<div class="alert-bar" role="status">
-        <p><strong>Alert.</strong> ${escapeHtml(who)}${escapeHtml(where)}. ${escapeHtml(alert.message)} <a href="${href}">Open device</a></p>
-        <button type="button" data-dismiss-alert="${escapeHtml(alert.id)}">Dismiss</button>
-      </div>`;
+  if (!alerts.length) return '<p class="empty alert-empty">No open alerts.</p>';
+  return `<ul class="alert-list">${alertGroups(alerts)
+    .map((group) => {
+      const latest = group.items[0];
+      const who = group.email || 'No email';
+      const href = group.deviceId ? `/device/${encodeURIComponent(group.deviceId)}` : '/';
+      const ids = group.items.map((alert) => alert.id).join(',');
+      const count = group.items.length > 1 ? `<span class="alert-chip">${group.items.length} alerts</span>` : '';
+      const meta = [group.hostname, formatWhen(latest.at)].filter(Boolean).join(' · ');
+      return `<li class="alert-item" data-alert-ids="${escapeHtml(ids)}">
+        <div class="alert-main">
+          <p class="alert-who"><strong>${escapeHtml(who)}</strong>${count}</p>
+          <p class="alert-msg">${escapeHtml(latest.message || 'Alert')}</p>
+          <p class="alert-meta">${escapeHtml(meta)}</p>
+        </div>
+        <div class="alert-actions">
+          <a class="ghost small" href="${href}">Open</a>
+          <button type="button" class="ghost small" data-dismiss-alert="${escapeHtml(ids)}" aria-label="Dismiss alerts for ${escapeHtml(who)}">Dismiss</button>
+        </div>
+      </li>`;
     })
-    .join('')}</div>`;
+    .join('')}</ul>`;
+}
+
+function dismissAlerts(ids, all) {
+  const wanted = new Set((ids || []).map((id) => String(id)));
+  const list = loadAlerts();
+  let changed = false;
+  for (const alert of list) {
+    if (alert.dismissed) continue;
+    if (all || wanted.has(String(alert.id))) {
+      alert.dismissed = true;
+      changed = true;
+    }
+  }
+  if (changed) saveAlerts(list);
+}
+
+function alertPayload() {
+  const alerts = openAlerts();
+  return {
+    alerts: alertMarkup(alerts),
+    alertIds: alerts.map((alert) => alert.id),
+    alertCount: alerts.length
+  };
 }
 
 function isOnline(device) {
@@ -181,6 +265,44 @@ function freshPending(device) {
   const created = Date.parse(device.pending.createdAt);
   if (!Number.isFinite(created) || Date.now() - created > REQUEST_MS) return null;
   return device.pending;
+}
+
+function freshCommand(device) {
+  if (!device?.command?.id || !device.command.createdAt || !REMOTE_TYPES.has(device.command.type)) return null;
+  const delivered = Date.parse(device.command.deliveredAt || '');
+  if (Number.isFinite(delivered)) {
+    return Date.now() - delivered > COMMAND_RUN_MS ? null : device.command;
+  }
+  const created = Date.parse(device.command.createdAt);
+  if (!Number.isFinite(created) || Date.now() - created > REQUEST_MS) return null;
+  return device.command;
+}
+
+/** A command that ran out of time without an answer becomes an error the admin can see. */
+function expiredCommandResult(device) {
+  const command = device?.command;
+  if (!command?.id || !REMOTE_TYPES.has(command.type) || freshCommand(device)) return null;
+  return {
+    id: command.id,
+    type: command.type,
+    status: 'error',
+    error: command.deliveredAt
+      ? 'The app took the action but never said it finished.'
+      : 'The app never picked it up. Make sure this computer runs the latest Dat Desk.',
+    at: new Date().toISOString()
+  };
+}
+
+function freshCommandResult(device) {
+  const result = device?.commandResult;
+  if (!result?.at || !REMOTE_TYPES.has(result.type)) return null;
+  const at = Date.parse(result.at);
+  if (!Number.isFinite(at) || Date.now() - at > 2 * 60 * 1000) return null;
+  return result;
+}
+
+function remoteVerb(type) {
+  return REMOTE_ACTIONS.find((action) => action.type === type)?.verb || 'run that action';
 }
 
 function listReports() {
@@ -285,6 +407,23 @@ function layout(title, body, options = {}) {
   const refreshSeconds = Number(options.refreshSeconds) || 0;
   const galleries = options.galleries;
   const subtitle = options.subtitle || 'Dat Desk screens';
+  const alertList = options.board ? options.alerts || [] : null;
+  const alertCount = alertList ? alertList.length : 0;
+  const alertControl = alertList
+    ? `<button type="button" id="alert-toggle" class="alert-toggle${alertCount ? ' has-alerts' : ''}" aria-expanded="false" aria-controls="alert-panel" aria-label="${alertCount === 1 ? '1 open alert' : `${alertCount} open alerts`}">
+        <span class="alert-dot" aria-hidden="true"></span>Alerts <span id="alert-count" class="alert-badge">${alertCount}</span>
+      </button>`
+    : '';
+  const alertPanel = alertList
+    ? `<section id="alert-panel" class="alert-panel" aria-labelledby="alert-heading" hidden>
+        <div class="alert-panel-head">
+          <h2 id="alert-heading">Open alerts</h2>
+          <button type="button" id="alert-dismiss-all" class="ghost small"${alertCount ? '' : ' disabled'}>Dismiss all</button>
+          <button type="button" id="alert-close" class="ghost small">Close</button>
+        </div>
+        <div id="alert-slot" class="alert-scroll">${alertMarkup(alertList)}</div>
+      </section>`
+    : '';
   const viewer = galleries
     ? `<div class="viewer" id="viewer" hidden role="dialog" aria-modal="true" aria-labelledby="viewer-caption">
         <div class="viewer-bar">
@@ -415,12 +554,164 @@ function layout(title, body, options = {}) {
           document.addEventListener('pointerdown', function () {
             if (alertAudio && alertAudio.state === 'suspended') alertAudio.resume();
           });
+          const alertToggle = document.getElementById('alert-toggle');
+          const alertPanel = document.getElementById('alert-panel');
+          const alertSlot = document.getElementById('alert-slot');
+          const alertCount = document.getElementById('alert-count');
+          const alertClose = document.getElementById('alert-close');
+          const alertAll = document.getElementById('alert-dismiss-all');
+          // Ids dismissed here but maybe still in an answer that was already on its way.
+          const dismissing = {};
+          let alertHtml = alertSlot ? alertSlot.innerHTML : '';
+
+          function setAlertCount(count) {
+            if (alertCount) alertCount.textContent = String(count);
+            if (alertToggle) {
+              alertToggle.classList.toggle('has-alerts', count > 0);
+              alertToggle.setAttribute('aria-label', count === 1 ? '1 open alert' : count + ' open alerts');
+            }
+            if (alertAll) alertAll.disabled = count === 0;
+          }
+          function openAlertPanel() {
+            if (!alertPanel) return;
+            alertPanel.hidden = false;
+            if (alertToggle) alertToggle.setAttribute('aria-expanded', 'true');
+          }
+          function closeAlertPanel(returnFocus) {
+            if (!alertPanel || alertPanel.hidden) return;
+            alertPanel.hidden = true;
+            if (alertToggle) {
+              alertToggle.setAttribute('aria-expanded', 'false');
+              if (returnFocus) alertToggle.focus();
+            }
+          }
+          function countShown() {
+            if (!alertSlot) return 0;
+            let total = 0;
+            alertSlot.querySelectorAll('[data-alert-ids]').forEach(function (row) {
+              total += row.getAttribute('data-alert-ids').split(',').filter(Boolean).length;
+            });
+            return total;
+          }
+          function showEmptyIfNone() {
+            if (alertSlot && !alertSlot.querySelector('[data-alert-ids]')) {
+              alertSlot.innerHTML = '<p class="empty alert-empty">No open alerts.</p>';
+            }
+          }
+          function sendDismiss(body) {
+            return fetch('/alerts/dismiss', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(body)
+            }).then(function (response) { return response.ok ? response.json() : null; }).catch(function () { return null; });
+          }
+          if (alertToggle) {
+            alertToggle.addEventListener('click', function () {
+              if (alertPanel && alertPanel.hidden) openAlertPanel();
+              else closeAlertPanel(false);
+            });
+          }
+          if (alertClose) alertClose.addEventListener('click', function () { closeAlertPanel(true); });
+          if (alertAll) {
+            alertAll.addEventListener('click', function () {
+              if (!alertSlot) return;
+              alertSlot.querySelectorAll('[data-alert-ids]').forEach(function (row) {
+                row.getAttribute('data-alert-ids').split(',').forEach(function (id) { if (id) dismissing[id] = true; });
+              });
+              alertSlot.innerHTML = '<p class="empty alert-empty">No open alerts.</p>';
+              alertHtml = '';
+              setAlertCount(0);
+              sendDismiss({ all: true });
+            });
+          }
           document.addEventListener('click', function (event) {
             const button = event.target.closest('[data-dismiss-alert]');
-            if (!button) return;
-            fetch('/alerts/' + encodeURIComponent(button.getAttribute('data-dismiss-alert')) + '/dismiss', { method: 'POST' })
-              .catch(function () {});
+            if (button) {
+              const ids = button.getAttribute('data-dismiss-alert').split(',').filter(Boolean);
+              ids.forEach(function (id) { dismissing[id] = true; });
+              const row = button.closest('[data-alert-ids]');
+              if (row) row.remove();
+              showEmptyIfNone();
+              alertHtml = '';
+              setAlertCount(countShown());
+              sendDismiss({ ids: ids });
+              return;
+            }
+            if (alertPanel && !alertPanel.hidden && !event.target.closest('#alert-panel') && !event.target.closest('#alert-toggle')) {
+              closeAlertPanel(false);
+            }
           });
+          document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape' && alertPanel && !alertPanel.hidden && viewer.hidden) closeAlertPanel(true);
+          });
+
+          function applyAlerts(data) {
+            const ids = Array.isArray(data.alertIds) ? data.alertIds : [];
+            // Skip one round if the server still lists something we just dismissed.
+            const stale = ids.some(function (id) { return dismissing[id]; });
+            Object.keys(dismissing).forEach(function (id) { if (ids.indexOf(id) === -1) delete dismissing[id]; });
+            let fresh = false;
+            ids.forEach(function (id) {
+              if (alertsReady && !seenAlerts[id]) fresh = true;
+              seenAlerts[id] = true;
+            });
+            alertsReady = true;
+            if (stale) return;
+            if (alertSlot && data.alerts != null && data.alerts !== alertHtml) {
+              const scroll = alertSlot.scrollTop;
+              alertSlot.innerHTML = data.alerts;
+              alertSlot.scrollTop = scroll;
+              alertHtml = data.alerts;
+            }
+            setAlertCount(ids.length);
+            if (fresh) {
+              playAlert();
+              openAlertPanel();
+              if (alertToggle) {
+                alertToggle.classList.remove('flash');
+                void alertToggle.offsetWidth;
+                alertToggle.classList.add('flash');
+              }
+            }
+          }
+
+          // Home page search and status filters; re-applied after every refresh.
+          function applyHomeFilters() {
+            const liveText = (document.getElementById('live-filter') || {}).value || '';
+            const emailText = (document.getElementById('email-filter') || {}).value || '';
+            const emailKind = (document.getElementById('email-kind') || {}).value || '';
+            let liveShown = 0;
+            document.querySelectorAll('#live-slot [data-search]').forEach(function (card) {
+              const show = card.getAttribute('data-search').indexOf(liveText.trim().toLowerCase()) !== -1;
+              card.hidden = !show;
+              if (show) liveShown += 1;
+            });
+            let emailShown = 0;
+            document.querySelectorAll('#people-slot [data-search]').forEach(function (row) {
+              let show = row.getAttribute('data-search').indexOf(emailText.trim().toLowerCase()) !== -1;
+              if (show && emailKind === 'live') show = row.getAttribute('data-live') === 'true';
+              if (show && emailKind === 'alert') show = row.getAttribute('data-alert') === 'true';
+              row.hidden = !show;
+              if (show) emailShown += 1;
+            });
+            const liveNone = document.getElementById('live-none');
+            if (liveNone) liveNone.hidden = !liveText.trim() || liveShown > 0;
+            const emailNone = document.getElementById('email-none');
+            if (emailNone) emailNone.hidden = (!emailText.trim() && !emailKind) || emailShown > 0;
+          }
+          ['live-filter', 'email-filter', 'email-kind'].forEach(function (id) {
+            const field = document.getElementById(id);
+            if (!field) return;
+            field.addEventListener('input', applyHomeFilters);
+            field.addEventListener('change', applyHomeFilters);
+          });
+          applyHomeFilters();
+          (function () {
+            const initialIds = ${jsonForScript(options.alertIds || [])};
+            initialIds.forEach(function (id) { seenAlerts[id] = true; });
+            alertsReady = true;
+          })();
+
           setInterval(function () {
             fetch('/fragment/board').then(function (response) {
               if (!response.ok) return null;
@@ -428,25 +719,18 @@ function layout(title, body, options = {}) {
             }).then(function (data) {
               if (!data) return;
               const liveSlot = document.getElementById('live-slot');
-              const inboxSlot = document.getElementById('inbox-slot');
               const liveCount = document.getElementById('live-count');
-              const alertSlot = document.getElementById('alert-slot');
-              if (liveSlot && data.live != null) liveSlot.innerHTML = data.live;
+              if (liveSlot && data.live != null && liveSlot.innerHTML !== data.live) liveSlot.innerHTML = data.live;
               if (liveCount) liveCount.textContent = data.liveCount + ' open';
-              if (alertSlot && data.alerts != null) alertSlot.innerHTML = data.alerts;
-              const ids = Array.isArray(data.alertIds) ? data.alertIds : [];
-              if (alertsReady) {
-                ids.forEach(function (id) {
-                  if (!seenAlerts[id]) playAlert();
-                });
-              }
-              alertsReady = true;
-              ids.forEach(function (id) { seenAlerts[id] = true; });
+              const headerNote = document.getElementById('header-live');
+              if (headerNote) headerNote.textContent = data.liveCount + ' live';
+              applyAlerts(data);
               const peopleSlot = document.getElementById('people-slot');
               if (peopleSlot && data.people != null && data.peopleSignature !== inboxSignature) {
                 inboxSignature = data.peopleSignature;
                 peopleSlot.innerHTML = data.people;
               }
+              applyHomeFilters();
             }).catch(function () {});
           }, 2000);
         }
@@ -801,7 +1085,7 @@ function layout(title, body, options = {}) {
     :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .skip { position: absolute; left: 8px; top: -48px; background: #fff; color: var(--header); padding: 8px 12px; z-index: 40; }
     .skip:focus { top: 8px; }
-    header { display: flex; align-items: center; gap: 16px; height: 56px; padding: 0 24px; background: var(--header); color: #fff; position: sticky; top: 0; z-index: 5; }
+    header { display: flex; align-items: center; gap: 16px; height: 56px; padding: 0 24px; background: var(--header); color: #fff; position: sticky; top: 0; z-index: 20; }
     .brand { color: #fff; font-weight: 700; text-decoration: none; font-size: 16px; letter-spacing: 0.01em; }
     .header-note { margin: 0 0 0 auto; color: #d0d7de; font-size: 14px; }
     main { margin: 0 auto; padding: 16px 24px 24px; }
@@ -835,7 +1119,7 @@ function layout(title, body, options = {}) {
     .workspace-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 12px; }
     .workspace-head h1 { margin-right: auto; }
     .workspace-head .meta { margin: 0; }
-    .device-split { display: grid; grid-template-columns: minmax(0, 7fr) minmax(260px, 3fr); gap: 16px; align-items: stretch; min-height: calc(100vh - 148px); }
+    .device-split { display: grid; grid-template-columns: minmax(0, 7fr) minmax(260px, 3fr); gap: 16px; align-items: stretch; height: calc(100vh - 96px); min-height: 480px; }
     .live-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
     .live-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--surface); }
     .live-bar h2 { margin-right: auto; }
@@ -884,14 +1168,52 @@ function layout(title, body, options = {}) {
     .pill.warn { background: #fff4e8; color: var(--warn); }
     .pill.stream { background: #e8f1fb; color: #0f3d75; }
     .pill.alert { background: #fdecea; color: #7a271a; }
-    .alert-stack { display: flex; flex-direction: column; gap: 8px; margin: 0 0 16px; }
-    .alert-bar {
-      display: flex; align-items: center; justify-content: space-between; gap: 12px;
-      background: #fdecea; border: 1px solid #f5c2c0; color: #7a271a; border-radius: 8px; padding: 12px 16px;
+    .alert-toggle {
+      display: inline-flex; align-items: center; gap: 8px; min-height: 36px; padding: 6px 12px;
+      background: #2a313b; color: #e6edf3; border: 1px solid #3d4652;
     }
-    .alert-bar p { margin: 0; }
-    .alert-bar a { color: #7a271a; font-weight: 700; }
-    .alert-bar button { background: #fff; color: #7a271a; border: 1px solid #e7b4b0; }
+    .alert-toggle:hover { background: #333c48; }
+    .alert-toggle .alert-dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7785; }
+    .alert-toggle .alert-badge {
+      min-width: 22px; padding: 0 6px; border-radius: 999px; background: #3d4652; color: #fff;
+      font-size: 12px; font-weight: 700; line-height: 20px; text-align: center; font-variant-numeric: tabular-nums;
+    }
+    .alert-toggle.has-alerts { background: #7a1d14; border-color: #b42318; color: #fff; }
+    .alert-toggle.has-alerts .alert-dot { background: #ffb4ab; }
+    .alert-toggle.has-alerts .alert-badge { background: #fff; color: #7a1d14; }
+    .alert-toggle.flash { animation: alert-flash 0.6s ease-in-out 3; }
+    @keyframes alert-flash { 50% { background: #d92d20; } }
+    .alert-panel {
+      position: fixed; top: 64px; right: 16px; z-index: 25; width: min(460px, calc(100vw - 32px));
+      max-height: calc(100vh - 80px); display: flex; flex-direction: column;
+      background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+      box-shadow: 0 16px 40px rgba(15, 23, 42, 0.22);
+    }
+    .alert-panel[hidden] { display: none; }
+    .alert-panel-head { display: flex; align-items: center; gap: 8px; padding: 12px 12px 12px 16px; border-bottom: 1px solid var(--line); }
+    .alert-panel-head h2 { margin-right: auto; }
+    .alert-scroll { overflow: auto; overscroll-behavior: contain; padding: 8px; }
+    .alert-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+    .alert-item {
+      display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px;
+      border: 1px solid #f5c2c0; border-left: 4px solid #b42318; border-radius: 8px; background: #fff8f7;
+    }
+    .alert-main { flex: 1; min-width: 0; }
+    .alert-main p { margin: 0; }
+    .alert-who { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 14px; overflow-wrap: anywhere; }
+    .alert-chip { font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 999px; background: #fdecea; color: #7a271a; border: 1px solid #f5c2c0; }
+    .alert-msg { color: #7a271a; font-size: 13px; margin-top: 2px !important; overflow-wrap: anywhere; }
+    .alert-meta { color: var(--muted); font-size: 12px; margin-top: 2px !important; }
+    .alert-actions { display: flex; flex-direction: column; gap: 6px; }
+    .alert-empty { padding: 16px; text-align: center; }
+    .ghost.small, button.small { min-height: 32px; padding: 4px 10px; font-size: 13px; text-align: center; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+    .filter-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+    .filter-row input, .filter-row select {
+      flex: 1; min-width: 140px; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line);
+      border-radius: 8px; background: #fff; color: var(--ink); font: inherit; font-size: 14px;
+    }
+    .filter-row select { flex: 0 0 auto; }
+    [data-search][hidden] { display: none !important; }
     .ok { color: var(--ok); }
     .warn { color: var(--warn); }
     label { display: block; font-size: 14px; color: var(--muted); margin-bottom: 8px; }
@@ -908,6 +1230,11 @@ function layout(title, body, options = {}) {
     form.card button { width: 100%; margin-top: 8px; }
     .inline-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0; }
     .inline-form .meta { margin: 0; }
+    .remote-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; }
+    .remote-actions button { background: #fff; color: var(--ink); border: 1px solid var(--line); }
+    .remote-actions button.danger { background: #fdecea; color: #7a271a; border-color: #f5c2c0; }
+    .remote-actions button:disabled { background: #eef1f4; color: var(--muted); border-color: var(--line); }
+    .remote-note { margin: 8px 0 0; }
     .shots { display: grid; grid-template-columns: 1fr; gap: 8px; }
     button.thumb {
       display: block; width: 100%; padding: 0; background: var(--stage); border-radius: 8px; overflow: hidden; cursor: zoom-in; text-align: left;
@@ -952,12 +1279,15 @@ function layout(title, body, options = {}) {
     #live-stage:fullscreen .live-frame { min-height: 0; }
     #live-stage:fullscreen .live-screens video,
     #live-stage:fullscreen .live-screens img { max-height: none; }
-    body.workspace main { height: calc(100vh - 56px); display: flex; flex-direction: column; overflow: hidden; padding-bottom: 16px; }
-    body.workspace .device-split { flex: 1; min-height: 0; }
+    .workspace-head #device-tools { flex-basis: 100%; }
     @media (max-width: 900px) {
       .home-split, .device-split { grid-template-columns: 1fr; }
-      body.workspace main { height: auto; overflow: visible; }
+      .device-split { height: auto; }
+      .side-pane { max-height: 80vh; }
       .live-frame { min-height: 320px; }
+      header { padding: 0 16px; }
+      main { padding: 12px 16px 24px; }
+      .alert-panel { top: 60px; right: 8px; width: calc(100vw - 16px); }
       .viewer-stage { grid-template-columns: 1fr; }
       .viewer-stage img { max-height: 58vh; }
     }
@@ -970,8 +1300,10 @@ function layout(title, body, options = {}) {
   <a class="skip" href="#content">Skip to content</a>
   <header>
     <a class="brand" href="/">TrackingEye</a>
-    <p class="header-note">${escapeHtml(subtitle)}</p>
+    <p class="header-note" id="header-live">${escapeHtml(subtitle)}</p>
+    ${alertControl}
   </header>
+  ${alertPanel}
   <main id="content">${body}</main>
   ${viewer}
 </body>
@@ -992,6 +1324,11 @@ function loginPage(error) {
   );
 }
 
+function inboxNotice(value) {
+  const notice = String(value || '');
+  return ['waiting', 'offline', 'denied', 'queued', 'sent', 'busy', 'bad'].includes(notice) ? notice : '';
+}
+
 function noticeBanner(notice, pending, reports) {
   const justCaptured = (reports || []).some((report) => {
     if (report.source !== 'admin') return false;
@@ -1009,6 +1346,13 @@ function noticeBanner(notice, pending, reports) {
     return '<p class="banner" role="status">This person has not allowed support to capture the screen.</p>';
   }
   if (notice === 'queued') return '<p class="banner" role="status">A capture request is already waiting.</p>';
+  if (notice === 'sent') {
+    return '<p class="banner" role="status">Sent. This Dat Desk will do it the next time it checks in.</p>';
+  }
+  if (notice === 'busy') {
+    return '<p class="banner" role="status">This Dat Desk is already doing a remote action. Wait for it to finish.</p>';
+  }
+  if (notice === 'bad') return '<p class="banner" role="status">That action is not available.</p>';
   return '';
 }
 
@@ -1051,7 +1395,8 @@ function deviceCards(devices, alertIds) {
       const where = [host + suffix, platformLabel(device.platform)].filter(Boolean).join(' · ');
       const href = `/device/${encodeURIComponent(device.deviceId)}`;
       const alert = flagged.has(device.deviceId);
-      return `<a class="live-card${alert ? ' is-alert' : ''}" href="${href}">
+      const search = [device.email, host, platformLabel(device.platform)].join(' ').toLowerCase();
+      return `<a class="live-card${alert ? ' is-alert' : ''}" href="${href}" data-search="${escapeHtml(search)}">
         <span class="marks">
           <span class="mark live">Live</span>
           ${signedIn ? '<span class="mark">Signed in</span>' : '<span class="mark">Sign-in screen</span>'}
@@ -1144,7 +1489,8 @@ function emailDirectory(reports, presence, entries, alerts) {
         row.online ? '<span class="mark live">Live</span>' : '',
         row.alert ? '<span class="mark alert">Alert</span>' : ''
       ].filter(Boolean).join('');
-      return `<a class="email-row${row.alert ? ' is-alert' : ''}" href="${row.href}">
+      const search = [label, ...row.devices.map((device) => device.hostname || '')].join(' ').toLowerCase();
+      return `<a class="email-row${row.alert ? ' is-alert' : ''}" href="${row.href}" data-search="${escapeHtml(search)}" data-live="${row.online}" data-alert="${row.alert}">
         <span class="email-top"><strong>${escapeHtml(label)}</strong><time>${escapeHtml(when)}</time></span>
         ${marks ? `<span class="marks">${marks}</span>` : ''}
         <span>${escapeHtml(what)}</span>
@@ -1160,13 +1506,16 @@ function inboxHome(reports, presence, entries, notice) {
   return layout(
     'TrackingEye',
     `${noticeBanner(notice, false, reports)}
-    <div id="alert-slot">${alertMarkup(alerts)}</div>
     <div class="home-split">
       <section class="panel" aria-labelledby="live-heading">
         <div class="section-head">
           <h1 id="live-heading">Live apps</h1>
           <p id="live-count">${devices.length} open</p>
         </div>
+        <div class="filter-row">
+          <input id="live-filter" type="search" placeholder="Search email or computer" aria-label="Search live apps" autocomplete="off" />
+        </div>
+        <p id="live-none" class="empty" hidden>No live app matches that search.</p>
         <div id="live-slot">${deviceCards(devices, alertIds)}</div>
       </section>
       <section class="panel" aria-labelledby="email-heading">
@@ -1174,12 +1523,23 @@ function inboxHome(reports, presence, entries, notice) {
           <h2 id="email-heading">Emails</h2>
           <p>Last recorded</p>
         </div>
+        <div class="filter-row">
+          <input id="email-filter" type="search" placeholder="Search email" aria-label="Search emails" autocomplete="off" />
+          <select id="email-kind" aria-label="Show">
+            <option value="">All</option>
+            <option value="live">Live now</option>
+            <option value="alert">With alerts</option>
+          </select>
+        </div>
+        <p id="email-none" class="empty" hidden>No email matches.</p>
         <div id="people-slot">${emailDirectory(reports, presence, entries, alerts)}</div>
       </section>
     </div>`,
     {
       galleries: {},
       board: true,
+      alerts,
+      alertIds: alerts.map((alert) => alert.id),
       subtitle: `${devices.length} live`
     }
   );
@@ -1253,8 +1613,7 @@ function workspacePage(options) {
   const alerts = openAlerts();
   return layout(
     options.title,
-    `<div id="alert-slot">${alertMarkup(alerts)}</div>
-    ${noticeBanner(options.notice, pending, reports)}
+    `${noticeBanner(options.notice, pending, reports)}
     <div class="workspace-head">
       <a class="back" href="/">All apps</a>
       <h1>${escapeHtml(options.heading)}</h1>
@@ -1299,6 +1658,8 @@ function workspacePage(options) {
       streamDevice: device?.deviceId || '',
       personKey: device?.deviceId ? '' : (options.personKey || ''),
       board: true,
+      alerts,
+      alertIds: alerts.map((alert) => alert.id),
       workspace: true,
       subtitle: options.heading
     }
@@ -1376,7 +1737,31 @@ function deviceTools(device) {
     device.allowRemote === true ? '<span class="pill ok">Capture on</span>' : '<span class="pill warn">Capture off</span>',
     device.allowLive === true ? '<span class="pill stream">Live view on</span>' : '<span class="pill warn">Live view off</span>'
   ].join('');
-  return `<div class="pills">${pills}</div>${captureForm(device, 'device')}`;
+  return `<div class="pills">${pills}</div>${captureForm(device, 'device')}${remoteActionForm(device)}`;
+}
+
+function remoteActionForm(device) {
+  const waiting = freshCommand(device);
+  const result = waiting ? null : freshCommandResult(device);
+  const disabled = waiting ? ' disabled' : '';
+  const buttons = REMOTE_ACTIONS.map((action) => {
+    const confirm = action.confirm ? ` onclick="return confirm('${action.confirm.replace(/'/g, '')}')"` : '';
+    const danger = action.danger ? ' danger' : '';
+    return `<button type="submit" name="type" value="${action.type}" class="${danger.trim()}"${disabled}${confirm}>${escapeHtml(action.label)}</button>`;
+  }).join('');
+  let status = '<p class="meta remote-note">Control this Dat Desk without opening the computer.</p>';
+  if (waiting) {
+    status = `<p class="meta remote-note">Waiting for this Dat Desk to ${escapeHtml(remoteVerb(waiting.type))}.</p>`;
+  } else if (result) {
+    const label = REMOTE_ACTIONS.find((action) => action.type === result.type)?.label || 'That action';
+    status = result.status === 'error'
+      ? `<p class="meta warn remote-note">${escapeHtml(label)} failed. ${escapeHtml(result.error || '')}</p>`
+      : `<p class="meta ok remote-note">${escapeHtml(label)} is done.</p>`;
+  }
+  return `<form method="post" action="/remote-commands" class="remote-actions">${buttons}
+    <input type="hidden" name="deviceId" value="${escapeHtml(device.deviceId)}" />
+    <input type="hidden" name="returnTo" value="device" />
+  </form>${status}`;
 }
 
 function saveReport(body) {
@@ -1459,6 +1844,9 @@ function upsertPresence(body) {
   const presence = loadPresence();
   const previous = presence[deviceId] || {};
   let pending = freshPending(previous);
+  const command = freshCommand(previous);
+  if (command && !command.deliveredAt) command.deliveredAt = new Date().toISOString();
+  const commandResult = freshCommandResult(previous);
   const allowRemote = body?.allowRemote === true;
   const allowLive = body?.allowLive === true;
   if (!allowRemote) pending = null;
@@ -1474,13 +1862,17 @@ function upsertPresence(body) {
     appVersion: String(body?.appVersion || '').slice(0, 40),
     platform: String(body?.platform || '').slice(0, 40),
     lastSeen: new Date().toISOString(),
-    pending
+    pending,
+    command,
+    commandResult,
+    lastCommand: previous.lastCommand || null
   };
   savePresence(presence);
   return {
     request: allowRemote && pending ? { id: pending.id, deviceId, email } : null,
     watch: allowLive && isWatched(deviceId),
-    liveGeneration: liveSessions.get(deviceId)?.generation || 0
+    liveGeneration: liveSessions.get(deviceId)?.generation || 0,
+    command: command ? { id: command.id, type: command.type, deviceId } : null
   };
 }
 
@@ -1568,6 +1960,32 @@ function queueCapture(deviceId) {
   return device;
 }
 
+function queueRemote(deviceId, type) {
+  const action = String(type || '');
+  const key = deviceKey(deviceId);
+  const presence = loadPresence();
+  const device = key ? presence[key] : null;
+  const fail = (code) => {
+    const error = new Error(code);
+    error.code = code;
+    error.device = device;
+    throw error;
+  };
+  if (!REMOTE_TYPES.has(action)) fail('bad');
+  if (!device || !isOnline(device)) fail('offline');
+  if (freshCommand(device)) fail('busy');
+  device.command = {
+    id: `${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`,
+    type: action,
+    createdAt: new Date().toISOString()
+  };
+  device.lastCommand = { id: device.command.id, type: action };
+  device.commandResult = null;
+  presence[key] = device;
+  savePresence(presence);
+  return device;
+}
+
 const ACTIVITY_EVENTS = new Set([
   'login',
   'logout',
@@ -1579,7 +1997,8 @@ const ACTIVITY_EVENTS = new Set([
   'signed_out',
   'screenshot',
   'settings',
-  'alert'
+  'alert',
+  'remote'
 ]);
 const ACTIVITY_KEEP = 4000;
 let activityWrite = Promise.resolve();
@@ -1629,6 +2048,13 @@ function cleanActivityDetail(event, raw) {
   if (event === 'alert') {
     detail.app = String(source.app || '').replace(/\s+/g, ' ').trim().slice(0, 80);
     detail.title = String(source.title || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+  }
+  if (event === 'remote') {
+    const action = String(source.action || '');
+    if (REMOTE_TYPES.has(action)) detail.action = action;
+    if (source.ok === false) detail.ok = false;
+    const error = String(source.error || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+    if (error) detail.error = error;
   }
   return detail;
 }
@@ -1699,6 +2125,13 @@ function activityText(entry) {
   }
   if (entry.event === 'alert') {
     return detail.app ? `Alert: ${detail.app}` : 'Alert';
+  }
+  if (entry.event === 'remote') {
+    const verb = remoteVerb(detail.action);
+    if (detail.ok === false) {
+      return detail.error ? `Could not ${verb}. ${detail.error}` : `Could not ${verb}.`;
+    }
+    return `Support asked this Dat Desk to ${verb}`;
   }
   if (entry.event === 'settings') {
     const capture = detail.allowRemote === true ? 'Capture on' : detail.allowRemote === false ? 'Capture off' : '';
@@ -1915,9 +2348,7 @@ app.get('/', (req, res) => {
   }
   const reports = listReports();
   const presence = loadPresence();
-  const notice = ['waiting', 'offline', 'denied', 'queued'].includes(String(req.query.notice || ''))
-    ? String(req.query.notice)
-    : '';
+  const notice = inboxNotice(req.query.notice);
   const view = String(req.query.view || '');
   if (view) {
     const key = view === '__none__' ? '' : emailKey(view);
@@ -1944,6 +2375,57 @@ app.post('/login', (req, res) => {
     `${COOKIE}=${adminCookie}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`
   );
   res.redirect('/');
+});
+
+app.post('/remote-commands', (req, res) => {
+  if (!isAdmin(req)) {
+    res.redirect('/');
+    return;
+  }
+  const deviceId = deviceKey(req.body?.deviceId);
+  try {
+    const device = queueRemote(deviceId, req.body?.type);
+    res.redirect(`/device/${encodeURIComponent(device.deviceId)}?notice=sent`);
+  } catch (err) {
+    const notice = ['offline', 'busy', 'bad'].includes(err.code) ? err.code : 'offline';
+    if (deviceId) {
+      res.redirect(`/device/${encodeURIComponent(deviceId)}?notice=${notice}`);
+      return;
+    }
+    res.redirect(`/?notice=${notice}`);
+  }
+});
+
+app.post('/api/command-result', (req, res) => {
+  if (!safeEqual(req.get('x-ingest-key') || '', INGEST_KEY)) {
+    res.status(401).json({ ok: false });
+    return;
+  }
+  const deviceId = deviceKey(req.body?.deviceId);
+  const id = String(req.body?.id || '').slice(0, 80);
+  if (!deviceId || !id) {
+    res.status(400).json({ ok: false });
+    return;
+  }
+  const presence = loadPresence();
+  const device = presence[deviceId];
+  // Accept late answers too: the command may have timed out while the app was still working.
+  const known = device?.command?.id === id ? device.command : device?.lastCommand?.id === id ? device.lastCommand : null;
+  if (!device || !known || !REMOTE_TYPES.has(known.type)) {
+    res.json({ ok: true });
+    return;
+  }
+  device.commandResult = {
+    id,
+    type: known.type,
+    status: req.body?.status === 'error' ? 'error' : 'done',
+    error: String(req.body?.error || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+    at: new Date().toISOString()
+  };
+  if (device.command?.id === id) device.command = null;
+  presence[deviceId] = device;
+  savePresence(presence);
+  res.json({ ok: true });
 });
 
 app.post('/capture-requests', (req, res) => {
@@ -1983,7 +2465,8 @@ app.post('/api/presence', (req, res) => {
       ok: true,
       request: result.request,
       watch: result.watch === true,
-      liveGeneration: result.liveGeneration || 0
+      liveGeneration: result.liveGeneration || 0,
+      command: result.command || null
     });
   } catch (err) {
     res.status(err.status || 500).json({ ok: false, message: err.message || 'Could not update presence.' });
@@ -2031,17 +2514,18 @@ app.post('/alerts/:id/dismiss', (req, res) => {
     res.status(401).json({ ok: false });
     return;
   }
-  const id = String(req.params.id || '');
-  const list = loadAlerts();
-  let changed = false;
-  for (const alert of list) {
-    if (alert.id === id && !alert.dismissed) {
-      alert.dismissed = true;
-      changed = true;
-    }
-  }
-  if (changed) saveAlerts(list);
+  dismissAlerts(String(req.params.id || '').split(','), false);
   res.json({ ok: true });
+});
+
+app.post('/alerts/dismiss', (req, res) => {
+  if (!isAdmin(req)) {
+    res.status(401).json({ ok: false });
+    return;
+  }
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.slice(0, 500) : [];
+  dismissAlerts(ids, req.body?.all === true);
+  res.json({ ok: true, ...alertPayload() });
 });
 
 app.get('/fragment/board', (req, res) => {
@@ -2070,6 +2554,7 @@ app.get('/fragment/board', (req, res) => {
     liveCount: devices.length,
     alerts: alertMarkup(alerts),
     alertIds: alerts.map((alert) => alert.id),
+    alertCount: alerts.length,
     people: emailDirectory(reports, presence, entries, alerts),
     peopleSignature: signature
   });
@@ -2120,9 +2605,7 @@ app.get('/user/:key', (req, res) => {
     res.redirect(`/device/${encodeURIComponent(pick.deviceId)}`);
     return;
   }
-  const notice = ['waiting', 'offline', 'denied', 'queued'].includes(String(req.query.notice || ''))
-    ? String(req.query.notice)
-    : '';
+  const notice = inboxNotice(req.query.notice);
   res.type('html').send(userPage(
     displayEmail(key, reports, entries, presence),
     key,
@@ -2179,9 +2662,7 @@ app.get('/device/:deviceId', (req, res) => {
     allowRemote: false,
     allowLive: false
   };
-  const notice = ['waiting', 'offline', 'denied', 'queued'].includes(String(req.query.notice || ''))
-    ? String(req.query.notice)
-    : '';
+  const notice = inboxNotice(req.query.notice);
   res.type('html').send(devicePage(device, reportsForEmail(listReports(), device.email), loadActivity(), notice));
 });
 

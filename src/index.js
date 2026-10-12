@@ -65,8 +65,15 @@ const REMOTE_ACTIONS = [
     verb: 'quit Dat Desk',
     danger: true,
     confirm: 'Quit Dat Desk on this computer and remove it from the tray?'
-  }
+  },
+  // Has its own form (email + password) on the sign-in screen, not a button.
+  { type: 'sign-in', label: 'Sign in', verb: 'sign in', form: true }
 ];
+/**
+ * Passwords for queued sign-ins, by command id. Kept in memory only (never in presence.json
+ * or logs) and wiped as soon as the app answers or the request expires.
+ */
+const commandSecrets = new Map();
 const REMOTE_TYPES = new Set(REMOTE_ACTIONS.map((action) => action.type));
 const liveFrames = new Map();
 const liveWatchers = new Map();
@@ -868,7 +875,9 @@ function layout(title, body, options = {}) {
               return response.json();
             }).then(function (part) {
               if (!part) return;
-              if (tools && part.tools && part.tools !== lastTools) {
+              const typing = tools && (tools.contains(document.activeElement) ||
+                Array.prototype.some.call(tools.querySelectorAll('input[type="password"]'), function (field) { return field.value; }));
+              if (tools && part.tools && part.tools !== lastTools && !typing) {
                 lastTools = part.tools;
                 tools.innerHTML = part.tools;
               }
@@ -1254,6 +1263,15 @@ function layout(title, body, options = {}) {
     .remote-actions button.danger { background: #fdecea; color: #7a271a; border-color: #f5c2c0; }
     .remote-actions button:disabled { background: #eef1f4; color: var(--muted); border-color: var(--line); }
     .remote-note { margin: 8px 0 0; }
+    .signin-form { margin: 12px 0 0; padding: 12px; background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; }
+    .signin-form h2 { font-size: 15px; }
+    .signin-form .meta { margin: 4px 0 8px; font-size: 13px; }
+    .signin-fields { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+    .signin-fields label { display: flex; flex-direction: column; gap: 4px; margin: 0; font-size: 13px; flex: 1; min-width: 180px; }
+    .signin-fields input {
+      min-height: 40px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+      background: #fff; color: var(--ink); font: inherit;
+    }
     .shots { display: grid; grid-template-columns: 1fr; gap: 8px; }
     button.thumb {
       display: block; width: 100%; padding: 0; background: var(--stage); border-radius: 8px; overflow: hidden; cursor: zoom-in; text-align: left;
@@ -1345,7 +1363,7 @@ function loginPage(error) {
 
 function inboxNotice(value) {
   const notice = String(value || '');
-  return ['waiting', 'offline', 'denied', 'queued', 'sent', 'busy', 'bad'].includes(notice) ? notice : '';
+  return ['waiting', 'offline', 'denied', 'queued', 'sent', 'busy', 'bad', 'signedin', 'missing'].includes(notice) ? notice : '';
 }
 
 function noticeBanner(notice, pending, reports) {
@@ -1372,6 +1390,10 @@ function noticeBanner(notice, pending, reports) {
     return '<p class="banner" role="status">This Dat Desk is already doing a remote action. Wait for it to finish.</p>';
   }
   if (notice === 'bad') return '<p class="banner" role="status">That action is not available.</p>';
+  if (notice === 'signedin') {
+    return '<p class="banner" role="status">This Dat Desk is already signed in. Sign it out first.</p>';
+  }
+  if (notice === 'missing') return '<p class="banner" role="status">Enter both the email and the password.</p>';
   return '';
 }
 
@@ -1763,7 +1785,7 @@ function remoteActionForm(device) {
   const waiting = freshCommand(device);
   const result = waiting ? null : freshCommandResult(device);
   const disabled = waiting ? ' disabled' : '';
-  const buttons = REMOTE_ACTIONS.map((action) => {
+  const buttons = REMOTE_ACTIONS.filter((action) => !action.form).map((action) => {
     const confirm = action.confirm ? ` onclick="return confirm('${action.confirm.replace(/'/g, '')}')"` : '';
     const danger = action.danger ? ' danger' : '';
     return `<button type="submit" name="type" value="${action.type}" class="${danger.trim()}"${disabled}${confirm}>${escapeHtml(action.label)}</button>`;
@@ -1777,10 +1799,33 @@ function remoteActionForm(device) {
       ? `<p class="meta warn remote-note">${escapeHtml(label)} failed. ${escapeHtml(result.error || '')}</p>`
       : `<p class="meta ok remote-note">${escapeHtml(label)} is done.</p>`;
   }
-  return `<form method="post" action="/remote-commands" class="remote-actions">${buttons}
+  return `${signInForm(device, waiting)}<form method="post" action="/remote-commands" class="remote-actions">${buttons}
     <input type="hidden" name="deviceId" value="${escapeHtml(device.deviceId)}" />
     <input type="hidden" name="returnTo" value="device" />
   </form>${status}`;
+}
+
+/** Shown while the app sits on its sign-in screen: support signs the person in for them. */
+function signInForm(device, waiting) {
+  if (device.loggedIn === true) return '';
+  const id = escapeHtml(device.deviceId);
+  const disabled = waiting ? ' disabled' : '';
+  return `<form method="post" action="/remote-commands" class="signin-form" autocomplete="off">
+    <h2>Sign in this Dat Desk</h2>
+    <p class="meta">The app is on its sign-in screen. Enter the person's Dat Desk login and it signs in on that computer.</p>
+    <div class="signin-fields">
+      <label>Email
+        <input type="email" name="email" value="${escapeHtml(device.email || '')}" required autocomplete="off" spellcheck="false" />
+      </label>
+      <label>Password
+        <input type="password" name="password" required autocomplete="new-password" />
+      </label>
+      <button type="submit"${disabled}>Sign in</button>
+    </div>
+    <input type="hidden" name="type" value="sign-in" />
+    <input type="hidden" name="deviceId" value="${id}" />
+    <input type="hidden" name="returnTo" value="device" />
+  </form>`;
 }
 
 function saveReport(body) {
@@ -1891,9 +1936,28 @@ function upsertPresence(body) {
     request: allowRemote && pending ? { id: pending.id, deviceId, email } : null,
     watch: allowLive && isWatched(deviceId),
     liveGeneration: liveSessions.get(deviceId)?.generation || 0,
-    command: command ? { id: command.id, type: command.type, deviceId } : null
+    command: command ? commandForDevice(command, deviceId) : null
   };
 }
+
+function commandForDevice(command, deviceId) {
+  const out = { id: command.id, type: command.type, deviceId };
+  if (command.type === 'sign-in') {
+    const secret = commandSecrets.get(command.id);
+    if (!secret || secret.deviceId !== deviceId) return null;
+    out.email = secret.email;
+    out.password = secret.password;
+  }
+  return out;
+}
+
+function sweepSecrets() {
+  const now = Date.now();
+  for (const [id, secret] of commandSecrets) {
+    if (now > secret.expires) commandSecrets.delete(id);
+  }
+}
+setInterval(sweepSecrets, 15000).unref();
 
 function isWatched(deviceId) {
   return liveSessions.get(deviceId)?.wanted === true;
@@ -1979,7 +2043,7 @@ function queueCapture(deviceId) {
   return device;
 }
 
-function queueRemote(deviceId, type) {
+function queueRemote(deviceId, type, extra = {}) {
   const action = String(type || '');
   const key = deviceKey(deviceId);
   const presence = loadPresence();
@@ -1993,11 +2057,26 @@ function queueRemote(deviceId, type) {
   if (!REMOTE_TYPES.has(action)) fail('bad');
   if (!device || !isOnline(device)) fail('offline');
   if (freshCommand(device)) fail('busy');
+  const email = String(extra.email || '').trim().slice(0, 200);
+  const password = String(extra.password || '');
+  if (action === 'sign-in') {
+    if (device.loggedIn === true) fail('signedin');
+    if (!email || !password || password.length > 500) fail('missing');
+  }
   device.command = {
     id: `${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`,
     type: action,
     createdAt: new Date().toISOString()
   };
+  if (action === 'sign-in') {
+    device.command.email = email;
+    commandSecrets.set(device.command.id, {
+      deviceId: key,
+      email,
+      password,
+      expires: Date.now() + REQUEST_MS
+    });
+  }
   device.lastCommand = { id: device.command.id, type: action };
   device.commandResult = null;
   presence[key] = device;
@@ -2403,10 +2482,13 @@ app.post('/remote-commands', (req, res) => {
   }
   const deviceId = deviceKey(req.body?.deviceId);
   try {
-    const device = queueRemote(deviceId, req.body?.type);
+    const device = queueRemote(deviceId, req.body?.type, {
+      email: req.body?.email,
+      password: req.body?.password
+    });
     res.redirect(`/device/${encodeURIComponent(device.deviceId)}?notice=sent`);
   } catch (err) {
-    const notice = ['offline', 'busy', 'bad'].includes(err.code) ? err.code : 'offline';
+    const notice = ['offline', 'busy', 'bad', 'signedin', 'missing'].includes(err.code) ? err.code : 'offline';
     if (deviceId) {
       res.redirect(`/device/${encodeURIComponent(deviceId)}?notice=${notice}`);
       return;
@@ -2434,6 +2516,7 @@ app.post('/api/command-result', (req, res) => {
     res.json({ ok: true });
     return;
   }
+  commandSecrets.delete(id);
   device.commandResult = {
     id,
     type: known.type,

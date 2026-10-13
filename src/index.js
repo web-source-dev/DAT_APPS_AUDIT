@@ -1120,7 +1120,12 @@ function layout(title, body, options = {}) {
     .skip:focus { top: 8px; }
     header { display: flex; align-items: center; gap: 16px; height: 56px; padding: 0 24px; background: var(--header); color: #fff; position: sticky; top: 0; z-index: 20; }
     .brand { color: #fff; font-weight: 700; text-decoration: none; font-size: 16px; letter-spacing: 0.01em; }
-    .header-note { margin: 0 0 0 auto; color: #d0d7de; font-size: 14px; }
+    .header-note { margin: 0 0 0 auto; color: #d0d7de; font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .header-link {
+      display: inline-flex; align-items: center; min-height: 36px; padding: 6px 12px; border-radius: 8px;
+      color: #e6edf3; text-decoration: none; font-size: 14px; font-weight: 600; border: 1px solid #3d4652;
+    }
+    .header-link:hover, .header-link[aria-current="page"] { background: #2a313b; }
     main { margin: 0 auto; padding: 16px 24px 24px; }
     h1, h2, h3 { margin: 0; overflow-wrap: anywhere; line-height: 1.25; }
     h1 { font-size: 20px; }
@@ -1343,6 +1348,9 @@ function layout(title, body, options = {}) {
   <header>
     <a class="brand" href="/">TrackingEye</a>
     <p class="header-note" id="header-live">${escapeHtml(subtitle)}</p>
+    ${options.board || options.manage
+      ? `<a class="header-link" href="/manage"${options.manage ? ' aria-current="page"' : ''}>Manage</a>`
+      : ''}
     ${alertControl}
   </header>
   ${alertPanel}
@@ -1664,6 +1672,9 @@ function workspacePage(options) {
       <a class="back" href="/">All apps</a>
       <h1>${escapeHtml(options.heading)}</h1>
       <p class="meta">${escapeHtml(options.sub || '')}</p>
+      ${emailKey(options.email || device?.email)
+        ? `<a class="ghost small" href="/manage?email=${encodeURIComponent(emailKey(options.email || device?.email))}">Manage records</a>`
+        : ''}
       <div id="device-tools">${options.tools}</div>
     </div>
     <div class="device-split">
@@ -2207,6 +2218,23 @@ function recordActivity(body) {
       console.warn('[TRACKINGEYE] Activity save failed:', err.message);
     });
   return entry;
+}
+
+/**
+ * Rewrites the activity log in the same queue as recordActivity, so a delete never loses an
+ * entry that arrived meanwhile. Resolves to how many entries were removed.
+ */
+function changeActivity(edit) {
+  const run = activityWrite.then(() => {
+    const list = loadActivity();
+    const next = edit(list);
+    if (next.length !== list.length) saveActivity(next);
+    return list.length - next.length;
+  });
+  activityWrite = run.catch((err) => {
+    console.warn('[TRACKINGEYE] Activity change failed:', err.message);
+  });
+  return run;
 }
 
 function formatDuration(ms) {
@@ -3000,6 +3028,24 @@ app.get('/live/:deviceId/:index', (req, res) => {
     set.delete(watcher);
     if (!set.size) liveWatchers.delete(id);
   });
+});
+
+require('./manage')(app, {
+  DATA_DIR,
+  isAdmin,
+  layout,
+  escapeHtml,
+  emailKey,
+  formatWhen,
+  listReports,
+  flattenShots,
+  loadActivity,
+  changeActivity,
+  loadAlerts,
+  saveAlerts,
+  activityText,
+  activityDetail,
+  activityKind
 });
 
 app.listen(PORT, HOST, () => {

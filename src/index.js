@@ -31,7 +31,7 @@ const REMOTE_ACTIONS = [
     type: 'close-dat',
     label: 'Close DAT',
     verb: 'close DAT and open the dashboard',
-    confirm: 'Close DAT on this computer and show the Dat Desk dashboard?'
+    confirm: 'Close DAT on this computer and show the app dashboard?'
   },
   { type: 'hide-dat', label: 'Hide DAT', verb: 'hide the DAT window' },
   { type: 'reload-dat', label: 'Reload DAT', verb: 'reload DAT' },
@@ -44,14 +44,14 @@ const REMOTE_ACTIONS = [
   {
     type: 'sign-out',
     label: 'Sign out',
-    verb: 'sign out of Dat Desk',
-    confirm: 'Sign this person out of Dat Desk? DAT closes and they must sign in again.'
+    verb: 'sign out of the app',
+    confirm: 'Sign this person out of the app? DAT closes and they must sign in again.'
   },
   {
     type: 'restart-app',
     label: 'Restart app',
-    verb: 'restart Dat Desk',
-    confirm: 'Restart Dat Desk on this computer? It closes and opens again on the dashboard.'
+    verb: 'restart the app',
+    confirm: 'Restart the app on this computer? It closes and opens again on the dashboard.'
   },
   {
     type: 'clear-cache',
@@ -62,9 +62,9 @@ const REMOTE_ACTIONS = [
   {
     type: 'quit-app',
     label: 'Quit app',
-    verb: 'quit Dat Desk',
+    verb: 'quit the app',
     danger: true,
-    confirm: 'Quit Dat Desk on this computer and remove it from the tray?'
+    confirm: 'Quit the app on this computer and remove it from the tray?'
   },
   // Has its own form (email + password) on the sign-in screen, not a button.
   { type: 'sign-in', label: 'Sign in', verb: 'sign in', form: true }
@@ -129,6 +129,11 @@ function formatWhen(iso) {
   const date = new Date(iso || '');
   if (Number.isNaN(date.getTime())) return '';
   return date.toLocaleString();
+}
+
+/** Which desktop app sent this (Dat Desk, Horizon, DAT HUB, DAT GO). Older builds send none. */
+function cleanAppName(value) {
+  return String(value || '').replace(/[^\w .-]/g, '').trim().slice(0, 40);
 }
 
 function deviceKey(id) {
@@ -314,7 +319,7 @@ function expiredCommandResult(device) {
     status: 'error',
     error: command.deliveredAt
       ? 'The app took the action but never said it finished.'
-      : 'The app never picked it up. Make sure this computer runs the latest Dat Desk.',
+      : 'The app never picked it up. Make sure this computer runs the latest app version.',
     at: new Date().toISOString()
   };
 }
@@ -389,7 +394,7 @@ function flattenShots(reports) {
       ? 'Code editor detected'
       : report.source === 'admin'
         ? 'Requested by support'
-        : 'Sent from Dat Desk';
+        : report.appName ? `Sent from ${report.appName}` : 'Sent from the app';
     files.forEach((file, index) => {
       const screen = files.length > 1 ? ` · Screen ${index + 1}` : '';
       shots.push({
@@ -432,7 +437,7 @@ function jsonForScript(value) {
 function layout(title, body, options = {}) {
   const refreshSeconds = Number(options.refreshSeconds) || 0;
   const galleries = options.galleries;
-  const subtitle = options.subtitle || 'Dat Desk screens';
+  const subtitle = options.subtitle || 'Desktop app screens';
   const alertList = options.board ? options.alerts || [] : null;
   const alertCount = alertList ? alertList.length : 0;
   const alertControl = alertList
@@ -901,10 +906,10 @@ function layout(title, body, options = {}) {
               }
               if (!watching) {
                 setNote(part.online !== true
-                  ? 'This Dat Desk is not open.'
+                  ? 'This app is not open.'
                   : allowed
                     ? 'The screen is covered.'
-                    : 'Live view is off. Turn on Allow live in Dat Desk.');
+                    : 'Live view is off. Turn on Allow live in the app.');
               }
               setButtons();
             }).catch(function () {});
@@ -927,7 +932,7 @@ function layout(title, body, options = {}) {
             if (!allowed || watching) return;
             watching = true;
             setButtons();
-            setNote('Asking Dat Desk to start.');
+            setNote('Asking the app to start.');
             if (stage) stage.replaceChildren();
             const started = await fetch('/watch', {
               method: 'POST',
@@ -939,7 +944,7 @@ function layout(title, body, options = {}) {
               setButtons();
               setNote(started && started.reason === 'denied'
                 ? 'This person has not allowed live view.'
-                : 'This Dat Desk is not open right now.');
+                : 'This app is not open right now.');
               return;
             }
             generation = started.generation;
@@ -986,7 +991,7 @@ function layout(title, body, options = {}) {
                 body: formBody()
               }).catch(function () {});
               stopPeer();
-              setNote('Dat Desk did not start the live view. Leave the app open, with Allow live checked, and try again.');
+              setNote('The app did not start the live view. Leave the app open, with Allow live checked, and try again.');
               return;
             }
             await pc.setRemoteDescription({ type: 'offer', sdp: offer });
@@ -1373,25 +1378,25 @@ function noticeBanner(notice, pending, reports) {
     return Number.isFinite(created) && Date.now() - created < REQUEST_MS;
   });
   if (notice === 'waiting' && pending) {
-    return '<p class="banner" role="status">Waiting for Dat Desk to send the screen. This page refreshes on its own.</p>';
+    return '<p class="banner" role="status">Waiting for the app to send the screen. This page refreshes on its own.</p>';
   }
   if (notice === 'waiting' && !justCaptured) {
-    return '<p class="banner" role="status">Dat Desk did not send a screenshot. The app needs to stay open, with Allow support to capture checked.</p>';
+    return '<p class="banner" role="status">The app did not send a screenshot. It needs to stay open, with Allow support to capture checked.</p>';
   }
-  if (notice === 'offline') return '<p class="banner" role="status">That Dat Desk app is not open right now.</p>';
+  if (notice === 'offline') return '<p class="banner" role="status">That app is not open right now.</p>';
   if (notice === 'denied') {
     return '<p class="banner" role="status">This person has not allowed support to capture the screen.</p>';
   }
   if (notice === 'queued') return '<p class="banner" role="status">A capture request is already waiting.</p>';
   if (notice === 'sent') {
-    return '<p class="banner" role="status">Sent. This Dat Desk will do it the next time it checks in.</p>';
+    return '<p class="banner" role="status">Sent. This app will do it the next time it checks in.</p>';
   }
   if (notice === 'busy') {
-    return '<p class="banner" role="status">This Dat Desk is already doing a remote action. Wait for it to finish.</p>';
+    return '<p class="banner" role="status">This app is already doing a remote action. Wait for it to finish.</p>';
   }
   if (notice === 'bad') return '<p class="banner" role="status">That action is not available.</p>';
   if (notice === 'signedin') {
-    return '<p class="banner" role="status">This Dat Desk is already signed in. Sign it out first.</p>';
+    return '<p class="banner" role="status">This app is already signed in. Sign it out first.</p>';
   }
   if (notice === 'missing') return '<p class="banner" role="status">Enter both the email and the password.</p>';
   return '';
@@ -1402,7 +1407,7 @@ function captureForm(device, returnTo) {
   const where = escapeHtml(device.hostname || 'This computer');
   const state = device.loggedIn ? 'Signed in' : 'On the sign-in screen';
   if (device.allowRemote !== true) {
-    return `<p class="meta warn">${where} is open (${state}). Capture is turned off on this Dat Desk.</p>`;
+    return `<p class="meta warn">${where} is open (${state}). Capture is turned off in this app.</p>`;
   }
   if (freshPending(device)) {
     return `<p class="meta">${where} is sending a screenshot.</p>`;
@@ -1419,7 +1424,7 @@ function captureForm(device, returnTo) {
 function deviceCards(devices, alertIds) {
   const flagged = alertIds instanceof Set ? alertIds : new Set(alertIds || []);
   if (!devices.length) {
-    return '<p class="empty">No Dat Desk app is open.</p>';
+    return '<p class="empty">No desktop app is open.</p>';
   }
   const marks = new Map();
   for (const device of devices) {
@@ -1433,10 +1438,10 @@ function deviceCards(devices, alertIds) {
       const mark = `${device.hostname}|${emailKey(device.email)}|${device.loggedIn === true}`;
       const host = device.hostname || 'This computer';
       const suffix = marks.get(mark) > 1 ? ` · ${String(device.deviceId).slice(-4)}` : '';
-      const where = [host + suffix, platformLabel(device.platform)].filter(Boolean).join(' · ');
+      const where = [host + suffix, device.appName || '', platformLabel(device.platform)].filter(Boolean).join(' · ');
       const href = `/device/${encodeURIComponent(device.deviceId)}`;
       const alert = flagged.has(device.deviceId);
-      const search = [device.email, host, platformLabel(device.platform)].join(' ').toLowerCase();
+      const search = [device.email, host, device.appName || '', platformLabel(device.platform)].join(' ').toLowerCase();
       return `<a class="live-card${alert ? ' is-alert' : ''}" href="${href}" data-search="${escapeHtml(search)}">
         <span class="marks">
           <span class="mark live">Live</span>
@@ -1647,10 +1652,10 @@ function workspacePage(options) {
     deviceId: device?.deviceId || ''
   });
   const note = !online
-    ? 'This Dat Desk is not open.'
+    ? 'This app is not open.'
     : allowLive
       ? 'The screen is covered.'
-      : 'Live view is off. Turn on Allow live in Dat Desk.';
+      : 'Live view is off. Turn on Allow live in the app.';
   const alerts = openAlerts();
   return layout(
     options.title,
@@ -1710,7 +1715,11 @@ function workspacePage(options) {
 function devicePage(device, reports, entries, notice) {
   const signedIn = device?.loggedIn === true && Boolean(emailKey(device?.email));
   const heading = signedIn ? device.email : 'Not signed in';
-  const sub = [device?.hostname || 'This computer', !signedIn && device?.email ? `Last email ${device.email}` : '']
+  const sub = [
+    device?.hostname || 'This computer',
+    device?.appName ? [device.appName, device.appVersion].filter(Boolean).join(' ') : '',
+    !signedIn && device?.email ? `Last email ${device.email}` : ''
+  ]
     .filter(Boolean)
     .join(' · ');
   return workspacePage({
@@ -1737,7 +1746,7 @@ function userPage(label, key, reports, entries, notice) {
     notice,
     email: key ? label : '',
     personKey: key || '__none__',
-    tools: '<p class="meta">This Dat Desk is not open right now.</p>'
+    tools: '<p class="meta">This app is not open right now.</p>'
   });
 }
 
@@ -1769,7 +1778,7 @@ function shotGrid(shots) {
 
 function deviceTools(device) {
   if (!device || !isOnline(device)) {
-    return '<p class="meta">This Dat Desk is not open right now.</p>';
+    return '<p class="meta">This app is not open right now.</p>';
   }
   const signedIn = device.loggedIn === true && Boolean(emailKey(device.email));
   const pills = [
@@ -1790,9 +1799,9 @@ function remoteActionForm(device) {
     const danger = action.danger ? ' danger' : '';
     return `<button type="submit" name="type" value="${action.type}" class="${danger.trim()}"${disabled}${confirm}>${escapeHtml(action.label)}</button>`;
   }).join('');
-  let status = '<p class="meta remote-note">Control this Dat Desk without opening the computer.</p>';
+  let status = '<p class="meta remote-note">Control this app without opening the computer.</p>';
   if (waiting) {
-    status = `<p class="meta remote-note">Waiting for this Dat Desk to ${escapeHtml(remoteVerb(waiting.type))}.</p>`;
+    status = `<p class="meta remote-note">Waiting for this app to ${escapeHtml(remoteVerb(waiting.type))}.</p>`;
   } else if (result) {
     const label = REMOTE_ACTIONS.find((action) => action.type === result.type)?.label || 'That action';
     status = result.status === 'error'
@@ -1811,8 +1820,8 @@ function signInForm(device, waiting) {
   const id = escapeHtml(device.deviceId);
   const disabled = waiting ? ' disabled' : '';
   return `<form method="post" action="/remote-commands" class="signin-form" autocomplete="off">
-    <h2>Sign in this Dat Desk</h2>
-    <p class="meta">The app is on its sign-in screen. Enter the person's Dat Desk login and it signs in on that computer.</p>
+    <h2>Sign in this ${escapeHtml(device.appName || 'app')}</h2>
+    <p class="meta">The app is on its sign-in screen. Enter the person's login and it signs in on that computer.</p>
     <div class="signin-fields">
       <label>Email
         <input type="email" name="email" value="${escapeHtml(device.email || '')}" required autocomplete="off" spellcheck="false" />
@@ -1870,6 +1879,7 @@ function saveReport(body) {
     message,
     email: String(body.email || '').slice(0, 200),
     userId: String(body.userId || '').slice(0, 80),
+    appName: cleanAppName(body.appName),
     appVersion: String(body.appVersion || '').slice(0, 40),
     platform: String(body.platform || '').slice(0, 40),
     hostname: String(body.hostname || '').slice(0, 120),
@@ -1899,7 +1909,7 @@ function saveReport(body) {
 function upsertPresence(body) {
   const deviceId = deviceKey(body?.deviceId);
   if (!deviceId) {
-    const error = new Error('This Dat Desk needs a restart before it can show up as live.');
+    const error = new Error('This app needs a restart before it can show up as live.');
     error.status = 400;
     throw error;
   }
@@ -1923,6 +1933,7 @@ function upsertPresence(body) {
     allowRemote,
     allowLive,
     hostname: String(body?.hostname || '').slice(0, 120),
+    appName: cleanAppName(body?.appName) || previous.appName || '',
     appVersion: String(body?.appVersion || '').slice(0, 40),
     platform: String(body?.platform || '').slice(0, 40),
     lastSeen: new Date().toISOString(),
@@ -2157,6 +2168,16 @@ function cleanActivityDetail(event, raw) {
   return detail;
 }
 
+/** Activity posts carry no app name; take it from the computer's presence. */
+function activityAppName(deviceId) {
+  if (!deviceId) return '';
+  try {
+    return loadPresence()[deviceId]?.appName || '';
+  } catch {
+    return '';
+  }
+}
+
 function recordActivity(body) {
   const event = String(body?.event || '');
   const email = String(body?.email || '').trim().slice(0, 200);
@@ -2172,6 +2193,7 @@ function recordActivity(body) {
     deviceId,
     hostname: String(body?.hostname || '').trim().slice(0, 120),
     platform: String(body?.platform || '').trim().slice(0, 80),
+    appName: cleanAppName(body?.appName) || activityAppName(deviceId),
     appVersion: String(body?.appVersion || '').trim().slice(0, 40),
     detail: cleanActivityDetail(event, body?.detail)
   };
@@ -2229,7 +2251,7 @@ function activityText(entry) {
     if (detail.ok === false) {
       return detail.error ? `Could not ${verb}. ${detail.error}` : `Could not ${verb}.`;
     }
-    return `Support asked this Dat Desk to ${verb}`;
+    return `Support asked this app to ${verb}`;
   }
   if (entry.event === 'settings') {
     const capture = detail.allowRemote === true ? 'Capture on' : detail.allowRemote === false ? 'Capture off' : '';
@@ -2244,7 +2266,7 @@ function activityDetail(entry) {
   const where = [
     entry.hostname || '',
     entry.platform || '',
-    entry.appVersion ? `Dat Desk ${entry.appVersion}` : ''
+    entry.appVersion ? `${entry.appName || 'App'} ${entry.appVersion}` : ''
   ].filter(Boolean);
   const bits = [];
   if (entry.event === 'dat_closed') {
